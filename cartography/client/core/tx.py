@@ -1,4 +1,7 @@
 import logging
+import json
+import psycopg
+from string import Template
 from typing import Any
 from typing import Dict
 from typing import List
@@ -6,9 +9,7 @@ from typing import Optional
 from typing import Tuple
 from typing import Union
 
-import neo4j
-
-from cartography.graph.querybuilder import build_create_index_queries
+from cartography.graph.querybuilder import build_create_table_queries
 from cartography.graph.querybuilder import build_create_index_queries_for_matchlink
 from cartography.graph.querybuilder import build_ingestion_query
 from cartography.graph.querybuilder import build_matchlink_query
@@ -20,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def read_list_of_values_tx(
-    tx: neo4j.Transaction,
+    cursor: psycopg.Cursor,
     query: str,
     **kwargs,
 ) -> List[Union[str, int]]:
@@ -43,14 +44,14 @@ def read_list_of_values_tx(
     :param kwargs: kwargs that are passed to tx.run()'s kwargs argument.
     :return: A list of str or int.
     """
-    result: neo4j.BoltStatementResult = tx.run(query, kwargs)
-    values = [n.value() for n in result]
-    result.consume()
+    cursor.execute(query, kwargs)
+    result = cursor.fetchall()
+    values = [n[0] for n in result]
     return values
 
 
 def read_single_value_tx(
-    tx: neo4j.Transaction,
+    cursor: psycopg.Cursor,
     query: str,
     **kwargs,
 ) -> Optional[Union[str, int]]:
@@ -75,17 +76,15 @@ def read_single_value_tx(
     :param kwargs: kwargs that are passed to tx.run()'s kwargs argument.
     :return: The result of the query as a single str, int, or None
     """
-    result: neo4j.BoltStatementResult = tx.run(query, kwargs)
-    record: neo4j.Record = result.single()
+    cursor.execute(query, kwargs)
+    record = cursor.fetchone()
 
-    value = record.value() if record else None
-
-    result.consume()
+    value = record[0] if record else None
     return value
 
 
 def read_list_of_dicts_tx(
-    tx: neo4j.Transaction,
+    cursor: psycopg.Cursor,
     query: str,
     **kwargs,
 ) -> List[Dict[str, Any]]:
@@ -104,14 +103,14 @@ def read_list_of_dicts_tx(
     :param kwargs: kwargs that are passed to tx.run()'s kwargs argument.
     :return: The result of the query as a list of dicts.
     """
-    result: neo4j.BoltStatementResult = tx.run(query, kwargs)
-    values = [n.data() for n in result]
-    result.consume()
+    cursor.execute(query, kwargs)
+    result = cursor.fetchall()
+    values = [dict(n) for n in result]
     return values
 
 
 def read_list_of_tuples_tx(
-    tx: neo4j.Transaction,
+    cursor: psycopg.Cursor,
     query: str,
     **kwargs,
 ) -> List[Tuple[Any, ...]]:
@@ -137,14 +136,14 @@ def read_list_of_tuples_tx(
     :param kwargs: kwargs that are passed to tx.run()'s kwargs argument.
     :return: The result of the query as a list of tuples.
     """
-    result: neo4j.BoltStatementResult = tx.run(query, kwargs)
-    values: List[Any] = result.values()
-    result.consume()
+    cursor.execute(query, kwargs)
+    result = cursor.fetchall()
+    values: List[Any] = result
     # All neo4j APIs return List type- https://neo4j.com/docs/api/python-driver/current/api.html#result - so we do this:
     return [tuple(val) for val in values]
 
 
-def read_single_dict_tx(tx: neo4j.Transaction, query: str, **kwargs) -> Any:
+def read_single_dict_tx(cursor: psycopg.Cursor, query: str, **kwargs) -> Any:
     """
     Runs the given Neo4j query in the given transaction object and returns the single dict result. This is intended to
     be run only with queries that return a single dict.
@@ -166,17 +165,15 @@ def read_single_dict_tx(tx: neo4j.Transaction, query: str, **kwargs) -> Any:
     :param kwargs: kwargs that are passed to tx.run()'s kwargs argument.
     :return: The result of the query as a single dict.
     """
-    result: neo4j.BoltStatementResult = tx.run(query, kwargs)
-    record: neo4j.Record = result.single()
+    cursor.execute(query, kwargs)
+    record = cursor.fetchone()
 
-    value = record.data() if record else None
-
-    result.consume()
+    value = dict(record) if record else None
     return value
 
 
 def write_list_of_dicts_tx(
-    tx: neo4j.Transaction,
+    cursor: psycopg.Cursor,
     query: str,
     **kwargs,
 ) -> None:
@@ -210,12 +207,12 @@ def write_list_of_dicts_tx(
     :param kwargs: Keyword args to be supplied to the Neo4j query.
     :return: None
     """
-    tx.run(query, kwargs)
+    cursor.execute(query, kwargs)
 
 
 def load_graph_data(
-    neo4j_session: neo4j.Session,
-    query: str,
+    cursor: psycopg.Cursor,
+    queries: List[str],
     dict_list: List[Dict[str, Any]],
     **kwargs,
 ) -> None:
@@ -229,16 +226,13 @@ def load_graph_data(
     :return: None
     """
     for data_batch in batch(dict_list, size=10000):
-        neo4j_session.write_transaction(
-            write_list_of_dicts_tx,
-            query,
-            DictList=data_batch,
-            **kwargs,
-        )
+        for query in queries:
+            write_list_of_dicts_tx(cursor, query, DictList=json.dumps(data_batch), **kwargs)
 
 
-def ensure_indexes(
-    neo4j_session: neo4j.Session,
+
+def ensure_tables(
+    cursor: psycopg.Cursor,
     node_schema: CartographyNodeSchema,
 ) -> None:
     """
@@ -249,20 +243,16 @@ def ensure_indexes(
     This ensures that every time we need to MATCH on a node to draw a relationship to it, the field used for the MATCH
     will be indexed, making the operation fast.
     :param neo4j_session: The neo4j session
-    :param node_schema: The node_schema object to create indexes for.
+    :param node_schema: The node_schema object to create tables for.
     """
-    queries = build_create_index_queries(node_schema)
-
+    queries = build_create_table_queries(node_schema)
+    logger.debug(f"CREATE TABLE queries for {node_schema.label}")
     for query in queries:
-        if not query.startswith("CREATE INDEX IF NOT EXISTS"):
-            raise ValueError(
-                'Query provided to `ensure_indexes()` does not start with "CREATE INDEX IF NOT EXISTS".',
-            )
-        neo4j_session.run(query)
+        cursor.execute(query)
 
 
 def ensure_indexes_for_matchlinks(
-    neo4j_session: neo4j.Session,
+    cursor: psycopg.Cursor,
     rel_schema: CartographyRelSchema,
 ) -> None:
     """
@@ -273,17 +263,14 @@ def ensure_indexes_for_matchlinks(
     queries = build_create_index_queries_for_matchlink(rel_schema)
     logger.debug(f"CREATE INDEX queries for {rel_schema.rel_label}: {queries}")
     for query in queries:
-        if not query.startswith("CREATE INDEX IF NOT EXISTS"):
-            raise ValueError(
-                'Query provided to `ensure_indexes_for_matchlinks()` does not start with "CREATE INDEX IF NOT EXISTS".',
-            )
-        neo4j_session.run(query)
+        cursor.execute(query)
 
 
 def load(
-    neo4j_session: neo4j.Session,
+    cursor: psycopg.Cursor,
     node_schema: CartographyNodeSchema,
     dict_list: List[Dict[str, Any]],
+    selected_relationships: Optional[set[CartographyRelSchema]] = None,
     **kwargs,
 ) -> None:
     """
@@ -298,13 +285,15 @@ def load(
     if len(dict_list) == 0:
         # If there is no data to load, save some time.
         return
-    ensure_indexes(neo4j_session, node_schema)
-    ingestion_query = build_ingestion_query(node_schema)
-    load_graph_data(neo4j_session, ingestion_query, dict_list, **kwargs)
+    ensure_tables(cursor, node_schema)
+    queries = build_ingestion_query(node_schema, selected_relationships)
+    for query in queries:
+        logger.debug(f"Ingestion query for {node_schema.label}: {query}")
+    load_graph_data(cursor, queries, dict_list, **kwargs)
 
 
 def load_matchlinks(
-    neo4j_session: neo4j.Session,
+    cursor: psycopg.Cursor,
     rel_schema: CartographyRelSchema,
     dict_list: list[dict[str, Any]],
     **kwargs,
@@ -334,7 +323,7 @@ def load_matchlinks(
             "This is needed for cleanup queries."
         )
 
-    ensure_indexes_for_matchlinks(neo4j_session, rel_schema)
+    ensure_indexes_for_matchlinks(cursor, rel_schema)
     matchlink_query = build_matchlink_query(rel_schema)
     logger.debug(f"Matchlink query: {matchlink_query}")
-    load_graph_data(neo4j_session, matchlink_query, dict_list, **kwargs)
+    load_graph_data(cursor, matchlink_query, dict_list, **kwargs)

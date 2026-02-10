@@ -1,3 +1,6 @@
+import sys
+sys.path.append("/Users/matthewxia/cartography")
+
 import logging
 from dataclasses import asdict
 from string import Template
@@ -11,11 +14,15 @@ from cartography.models.core.common import PropertyRef
 from cartography.models.core.nodes import CartographyNodeProperties
 from cartography.models.core.nodes import CartographyNodeSchema
 from cartography.models.core.nodes import ExtraNodeLabels
-from cartography.models.core.relationships import CartographyRelSchema
+from cartography.models.core.relationships import CartographyRelSchema, CartographyRelProperties
 from cartography.models.core.relationships import LinkDirection
 from cartography.models.core.relationships import OtherRelationships
 from cartography.models.core.relationships import SourceNodeMatcher
 from cartography.models.core.relationships import TargetNodeMatcher
+from cartography.models.core.relationships import make_target_node_matcher
+from cartography.models.cve.cve import CVEtoCVEFeedRel, CVESchema, CVEToSpotlightVulnerabilityRel
+from cartography.models.cve.cve_feed import CVEFeedSchema
+
 
 logger = logging.getLogger(__name__)
 
@@ -25,29 +32,9 @@ def _build_node_properties_statement(
     extra_node_labels: Optional[ExtraNodeLabels] = None,
 ) -> str:
     """
-    Generate a Neo4j clause that sets node properties using the given mapping of attribute names to PropertyRefs.
-
-    As seen in this example,
-
-        node_property_map: Dict[str, PropertyRef] = {
-            'id': PropertyRef("Id"),
-            'node_prop_1': PropertyRef("Prop1"),
-            'node_prop_2': PropertyRef("Prop2", set_in_kwargs=True),
-        }
-        set_clause: str = _build_node_properties_statement(node_property_map)
-
-    the returned set_clause will be
-        ```
-        i.id = item.Id,
-        i.node_prop_1 = item.Prop1,
-        i.node_prop_2 = $Prop2
-        ```
-    where `i` is a reference to the Neo4j node.
-    :param node_property_map: Mapping of node attribute names as str to PropertyRef objects
-    :param extra_node_labels: Optional ExtraNodeLabels object to set on the node as string
-    :return: The resulting Neo4j SET clause to set the given attributes on the node
+    Generate a SQL clause to set values of properties
     """
-    ingest_fields_template = Template("i.$node_property = $property_ref")
+    ingest_fields_template = Template('"$node_property" = $property_ref')
 
     set_clause = ",\n".join(
         [
@@ -94,7 +81,7 @@ def _build_rel_properties_statement(
     :return: The resulting Neo4j SET clause to set the given attributes on the relationship
     """
     set_clause = ""
-    ingest_fields_template = Template("$rel_var.$rel_property = $property_ref")
+    ingest_fields_template = Template('"$rel_property" = $property_ref')
 
     if rel_property_map:
         set_clause += ",\n".join(
@@ -110,15 +97,15 @@ def _build_rel_properties_statement(
     return set_clause
 
 
-def _build_match_clause(matcher: TargetNodeMatcher | SourceNodeMatcher) -> str:
+def _build_where_clause(matcher: TargetNodeMatcher | SourceNodeMatcher) -> str:
     """
     Generate a Neo4j match statement on one or more keys and values for a given node.
     :param matcher: A TargetNodeMatcher or SourceNodeMatcher object
     :return: a Neo4j match clause
     """
-    match = Template("$Key: $PropRef")
+    match = Template('j."$Key" = $PropRef')
     matcher_asdict = asdict(matcher)
-    return ", ".join(
+    return " AND\n".join(
         match.safe_substitute(Key=key, PropRef=prop_ref)
         for key, prop_ref in matcher_asdict.items()
     )
@@ -134,13 +121,13 @@ def _build_where_clause_for_rel_match(
     :param matcher: A TargetNodeMatcher object
     :return: a Neo4j where clause
     """
-    match = Template("$node_var.$key = $prop_ref")
-    case_insensitive_match = Template("toLower($node_var.$key) = toLower($prop_ref)")
+    match = Template('$node_var."$key" = $prop_ref')
+    case_insensitive_match = Template('LOWER($node_var."$key") = LOWER($prop_ref)')
     fuzzy_and_ignorecase_match = Template(
-        "toLower($node_var.$key) CONTAINS toLower($prop_ref)"
+        'LOWER("$key") LIKE %LOWER($prop_ref)%'
     )
     # This assumes that item.$prop_ref points to a list available on the data object
-    one_to_many_match = Template("$node_var.$key IN $prop_ref")
+    one_to_many_match = Template('$node_var."$key" IN $prop_ref')
 
     matcher_asdict = asdict(matcher)
 
@@ -148,9 +135,8 @@ def _build_where_clause_for_rel_match(
     for key, prop_ref in matcher_asdict.items():
         if prop_ref.ignore_case:
             prop_line = case_insensitive_match.safe_substitute(
-                node_var=node_var,
-                key=key,
-                prop_ref=prop_ref,
+                node_var=node_var, key=key, prop_ref=prop_ref
+
             )
         elif prop_ref.fuzzy_and_ignore_case:
             prop_line = fuzzy_and_ignorecase_match.safe_substitute(
@@ -164,9 +150,8 @@ def _build_where_clause_for_rel_match(
         else:
             # Exact match (default; most efficient)
             prop_line = match.safe_substitute(
-                node_var=node_var,
-                key=key,
-                prop_ref=prop_ref,
+                 node_var=node_var, key=key, prop_ref=prop_ref
+
             )
         result.append(prop_line)
     return " AND\n".join(result)
@@ -217,22 +202,23 @@ def _build_attach_sub_resource_statement(
 
     sub_resource_attach_template = Template(
         """
-        WITH i, item
-        OPTIONAL MATCH (j:$SubResourceLabel{$MatchClause})
-        WITH i, item, j WHERE j IS NOT NULL
-        $RelMergeClause
-        ON CREATE SET r.firstseen = timestamp()
-        SET
+        INSERT INTO $SubResourceRelLabel (from_id, to_id, firstseen, lastupdated)
+        $RelSelectClause
+        FROM $SubResourceLabel j
+        JOIN items i ON true
+        WHERE
+            $WhereClause
+        ON CONFLICT (from_id, to_id) DO UPDATE SET
             $set_rel_properties_statement
         """,
     )
 
     if sub_resource_link.direction == LinkDirection.INWARD:
-        rel_merge_template = Template("""MERGE (i)<-[r:$SubResourceRelLabel]-(j)""")
+        rel_select_template = Template("""SELECT j.id, i.id, EXTRACT(EPOCH FROM NOW()) * 1000, %(lastupdated)s""")
     else:
-        rel_merge_template = Template("""MERGE (i)-[r:$SubResourceRelLabel]->(j)""")
+        rel_select_template = Template("""SELECT i.id, j.id, EXTRACT(EPOCH FROM NOW()) * 1000, %(lastupdated)s""")
 
-    rel_merge_clause = rel_merge_template.safe_substitute(
+    rel_select_clause = rel_select_template.safe_substitute(
         SubResourceRelLabel=sub_resource_link.rel_label,
     )
 
@@ -242,8 +228,8 @@ def _build_attach_sub_resource_statement(
 
     attach_sub_resource_statement = sub_resource_attach_template.safe_substitute(
         SubResourceLabel=sub_resource_link.target_node_label,
-        MatchClause=_build_match_clause(sub_resource_link.target_node_matcher),
-        RelMergeClause=rel_merge_clause,
+        WhereClause=_build_where_clause(sub_resource_link.target_node_matcher),
+        RelSelectClause=rel_select_clause,
         SubResourceRelLabel=sub_resource_link.rel_label,
         set_rel_properties_statement=_build_rel_properties_statement(
             "r",
@@ -270,14 +256,12 @@ def _build_attach_additional_links_statement(
 
     additional_links_template = Template(
         """
-        WITH i, item
-        OPTIONAL MATCH ($node_var:$AddlLabel)
-        WHERE
-            $WhereClause
-        WITH i, item, $node_var WHERE $node_var IS NOT NULL
+        INSERT INTO $AddRelLabel (from_id, to_id, firstseen, lastupdated)
         $RelMerge
-        ON CREATE SET $rel_var.firstseen = timestamp()
-        SET
+        FROM $AddLabel $node_var
+        JOIN items item ON true
+            WHERE $WhereClause
+        ON CONFLICT (from_id, to_id) DO UPDATE SET
             $set_rel_properties_statement
         """,
     )
@@ -288,23 +272,22 @@ def _build_attach_additional_links_statement(
 
         if link.direction == LinkDirection.INWARD:
             rel_merge_template = Template(
-                """MERGE (i)<-[$rel_var:$AddlRelLabel]-($node_var)""",
+                """SELECT $node_var.id, item.id, EXTRACT(EPOCH FROM NOW()) * 1000, %(lastupdated)s""",
             )
         else:
             rel_merge_template = Template(
-                """MERGE (i)-[$rel_var:$AddlRelLabel]->($node_var)""",
+                """SELECT item.id, $node_var.id, EXTRACT(EPOCH FROM NOW()) * 1000, %(lastupdated)s""",
             )
 
         rel_merge = rel_merge_template.safe_substitute(
-            rel_var=rel_var,
-            AddlRelLabel=link.rel_label,
             node_var=node_var,
         )
 
         rel_props_as_dict = _asdict_with_validate_relprops(link)
 
         additional_ref = additional_links_template.safe_substitute(
-            AddlLabel=link.target_node_label,
+            AddRelLabel = link.rel_label,
+            AddLabel=link.target_node_label,
             WhereClause=_build_where_clause_for_rel_match(
                 node_var,
                 link.target_node_matcher,
@@ -319,8 +302,7 @@ def _build_attach_additional_links_statement(
         )
         links.append(additional_ref)
 
-    return "UNION".join(links)
-
+    return ";\n".join(links)
 
 def _build_attach_relationships_statement(
     sub_resource_relationship: Optional[CartographyRelSchema],
@@ -352,19 +334,7 @@ def _build_attach_relationships_statement(
         [attach_additional_links_statement] if attach_additional_links_statement else []
     )
 
-    attach_relationships_statement = "UNION".join(stmt for stmt in statements)
-
-    query_template = Template(
-        """
-        WITH i, item
-        CALL {
-            $attach_relationships_statement
-        }
-        """,
-    )
-    return query_template.safe_substitute(
-        attach_relationships_statement=attach_relationships_statement,
-    )
+    return ";".join(stmt for stmt in statements)
 
 
 def rel_present_on_node_schema(
@@ -427,7 +397,7 @@ def filter_selected_relationships(
 def build_ingestion_query(
     node_schema: CartographyNodeSchema,
     selected_relationships: Optional[Set[CartographyRelSchema]] = None,
-) -> str:
+) -> List[str]:
     """
     Generates a Neo4j query from the given CartographyNodeSchema to ingest the specified nodes and relationships so that
     cartography module authors don't need to handwrite their own queries.
@@ -449,17 +419,31 @@ def build_ingestion_query(
     """
     query_template = Template(
         """
-        UNWIND $DictList AS item
-            MERGE (i:$node_label{id: $dict_id_field})
-            ON CREATE SET i.firstseen = timestamp()
-            SET
-                $set_node_properties_statement
-            $attach_relationships_statement
+        DROP TABLE IF EXISTS items CASCADE;
+        CREATE TEMP TABLE items AS (SELECT * FROM jsonb_to_recordset(%(DictList)s::jsonb) AS t($node_prop_list));
+
+        INSERT INTO $node_label (id, firstseen)
+        SELECT $dict_id_field, EXTRACT(EPOCH FROM NOW()) * 1000
+        FROM items item
+        ON CONFLICT (id) DO NOTHING
+        RETURNING *;
+
+        UPDATE $node_label n SET
+        $set_node_properties_statement
+        FROM items item
+        WHERE n.id = $dict_id_field;
+
+        $attach_relationships_statement;
+
         """,
     )
 
     node_props: CartographyNodeProperties = node_schema.properties
     node_props_as_dict: Dict[str, PropertyRef] = asdict(node_props)
+    node_props_as_list = []
+    for ref in node_props_as_dict.values():
+        if not ref.set_in_kwargs:
+            node_props_as_list.append(f'"{ref.name}" TEXT')
 
     # Handle selected relationships
     sub_resource_rel: Optional[CartographyRelSchema] = (
@@ -474,6 +458,7 @@ def build_ingestion_query(
 
     ingest_query = query_template.safe_substitute(
         node_label=node_schema.label,
+        node_prop_list = ",".join(node_props_as_list),
         dict_id_field=node_props.id,
         set_node_properties_statement=_build_node_properties_statement(
             node_props_as_dict,
@@ -484,10 +469,37 @@ def build_ingestion_query(
             other_rels,
         ),
     )
-    return ingest_query
+    return ingest_query.split(";")
 
 
-def build_create_index_queries(node_schema: CartographyNodeSchema) -> List[str]:
+def __build_node_table_statement(
+    node_schema: CartographyNodeSchema,
+) -> str:
+    node_props: CartographyNodeProperties = node_schema.properties
+    node_props_as_dict: Dict[str, PropertyRef] = asdict(node_props)
+    node_props_as_list = []
+    for ref_name, ref in node_props_as_dict.items():
+        if ref_name != "id":
+            node_props_as_list.append(f'"{ref_name}" TEXT')
+
+    create_table_clause = f"CREATE TABLE IF NOT EXISTS {node_schema.label} (id TEXT PRIMARY KEY, firstseen BIGINT, {', '.join(node_props_as_list)})"
+    return create_table_clause
+
+
+def __build_rel_table_statement(
+    rel_schema: CartographyRelSchema,
+) -> str:
+    rel_props: CartographyRelProperties = rel_schema.properties
+    rel_props_as_dict: Dict[str, PropertyRef] = asdict(rel_props)
+    rel_props_as_list = []
+    for ref_name, ref in rel_props_as_dict.items():
+        rel_props_as_list.append(f'"{ref_name}" TEXT')
+
+    create_table_clause = f"CREATE TABLE IF NOT EXISTS {rel_schema.rel_label} (from_id TEXT, to_id TEXT, firstseen BIGINT, {', '.join(rel_props_as_list)}, PRIMARY KEY (from_id, to_id))"
+    return create_table_clause
+
+
+def build_create_table_queries(node_schema: CartographyNodeSchema) -> List[str]:
     """
     Generate queries to create indexes for the given CartographyNodeSchema and all node types attached to it via its
     relationships.
@@ -495,11 +507,12 @@ def build_create_index_queries(node_schema: CartographyNodeSchema) -> List[str]:
     :return: A list of queries of the form `CREATE INDEX IF NOT EXISTS FOR (n:$TargetNodeLabel) ON (n.$TargetAttribute)`
     """
     index_template = Template(
-        "CREATE INDEX IF NOT EXISTS FOR (n:$TargetNodeLabel) ON (n.$TargetAttribute);",
+        'CREATE INDEX IF NOT EXISTS idx_${TargetNodeLabel}_${TargetAttribute} ON ${TargetNodeLabel}("${TargetAttribute}")',
     )
 
     # First ensure an index exists for the node_schema and all extra labels on the `id` and `lastupdated` fields
     result = [
+        __build_node_table_statement(node_schema),
         index_template.safe_substitute(
             TargetNodeLabel=node_schema.label,
             TargetAttribute="id",
@@ -530,10 +543,7 @@ def build_create_index_queries(node_schema: CartographyNodeSchema) -> List[str]:
     for rs in rel_schemas:
         for target_key in asdict(rs.target_node_matcher).keys():
             result.append(
-                index_template.safe_substitute(
-                    TargetNodeLabel=rs.target_node_label,
-                    TargetAttribute=target_key,
-                ),
+                __build_rel_table_statement(rs)
             )
 
     # Now, include extra indexes defined by the module author on the node schema's property refs.
@@ -569,7 +579,7 @@ def build_create_index_queries_for_matchlink(
         return []
 
     index_template = Template(
-        "CREATE INDEX IF NOT EXISTS FOR (n:$NodeLabel) ON (n.$NodeAttribute);",
+        'CREATE INDEX IF NOT EXISTS FOR (n:$NodeLabel) ON (n."$NodeAttribute");',
     )
 
     result = []
@@ -682,3 +692,4 @@ def build_matchlink_query(rel_schema: CartographyRelSchema) -> str:
             rel_props_as_dict,
         ),
     )
+

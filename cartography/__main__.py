@@ -1,4 +1,5 @@
 import sys
+sys.path.append("/Users/matthewxia/cartography")
 
 import cartography.cli
 
