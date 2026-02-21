@@ -19,12 +19,12 @@ You can learn more about the story behind Cartography in our [presentation at BS
 
 ## Setup
 Clone the repository and install dependencies
-'''bash
+```bash
 git clone https://github.com/Matthew-Xia/cartography
-'''
-'''bash
+```
+```bash
 pip install .
-'''
+```
 
 ## Run database
 Install postgres and follow the [instructions] (https://www.postgresql.org/docs/current/tutorial-start.html) to initialize the database.
@@ -34,9 +34,9 @@ Make sure the server is being run on localhost:5432
 ## Usage
 Request a NIST CVE API key through [this link](https://nvd.nist.gov/developers/request-an-api-key)
 
-'''bash
+```bash
 python3 cartography --cve-enabled --cve-api-key-env-var=<CVE_API_KEY>
-'''
+```
 
 ### Using Puppygraph
 Follow the instructions [here](https://docs.puppygraph.com/getting-started/querying-postgresql-data-as-a-graph/) on a demo for how to connect Puppygraph to a Postgres database.
