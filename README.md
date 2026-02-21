@@ -26,7 +26,7 @@ git clone https://github.com/Matthew-Xia/cartography
 pip install .
 ```
 
-## Run database
+## Initialize Postgres database
 Install postgres and follow the [instructions] (https://www.postgresql.org/docs/current/tutorial-start.html) to initialize the database.
 
 Make sure the server is being run on localhost:5432
